@@ -36,15 +36,6 @@ export function anyLnPath(element: Element): string {
   return anyLnPath(parent);
 }
 
-export function matchingLogicalNodes(doc: XMLDocument, lNode: Element): Element[] {
-  const lnClass = lNode.getAttribute('lnClass');
-  if (!lnClass) {
-    return [];
-  }
-  return Array.from(doc.querySelectorAll(':root > IED LDevice > LN0, :root > IED LDevice > LN'))
-    .filter(ln => ln.getAttribute('lnClass') === lnClass);
-}
-
 export function logicalNodeIndex(doc: XMLDocument): Map<string, Element> {
   const index = new Map<string, Element>();
   for (const ied of Array.from(doc.querySelectorAll(':root > IED'))) {

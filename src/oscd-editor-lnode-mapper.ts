@@ -6,50 +6,97 @@ import { newEditEventV2 } from '@openscd/oscd-api/utils.js';
 import { identity } from '@openscd/scl-lib';
 import { SldSubstationViewer } from '@omicronenergy/oscd-editor-sld/sld-substation-viewer.js';
 import { attributes } from '@omicronenergy/oscd-editor-sld/foundations.js';
-import { OscdActionList } from '@omicronenergy/oscd-ui/action-list/OscdActionList.js';
+import { OscdFilledButton } from '@omicronenergy/oscd-ui/button/OscdFilledButton.js';
 import { OscdOutlinedButton } from '@omicronenergy/oscd-ui/button/OscdOutlinedButton.js';
 import { OscdDialog } from '@omicronenergy/oscd-ui/dialog/OscdDialog.js';
 import { OscdIcon } from '@omicronenergy/oscd-ui/icon/OscdIcon.js';
 import { OscdIconButton } from '@omicronenergy/oscd-ui/iconbutton/OscdIconButton.js';
-import { OscdTree } from '@omicronenergy/oscd-ui/tree/OscdTree.js';
+import { OscdOutlinedSearchField } from '@omicronenergy/oscd-ui/search-field/OscdOutlinedSearchField.js';
 
-import { compareLNodeType } from './foundation/diffing.js';
+import {
+  assessCandidates,
+  bindingContext,
+  bindingStatus,
+  conflictingSibling,
+  noneEdit,
+} from './foundation/binding.js';
 import { hasLegacySldLayout } from './foundation/legacy-sld.js';
 import {
   anyLnPath,
   anyLnTitle,
-  linkEdit,
   linkedLogicalNode,
-  logicalNodeIndex,
   lNodePath,
   lNodeTitle,
-  matchingLogicalNodes,
 } from './foundation/lnode-mapping.js';
+import { OscdVirtualizedList } from './ui/OscdVirtualizedList.js';
 
-import type { ActionItem } from '@omicronenergy/oscd-ui/action-list/OscdActionList.js';
-import type { TreeRenderContext } from '@omicronenergy/oscd-ui/tree/OscdTree.js';
+import type { SetAttributes } from '@openscd/oscd-api';
+import type {
+  BindingContext,
+  BindingIssue,
+  BindingStatus,
+  CandidateAssessment,
+  TypeComparison,
+} from './foundation/binding.js';
 
-type TypeComparison = ReturnType<typeof compareLNodeType>;
-type LinkDetails = {
-  title: string;
-  message: string;
+const noneChoice = 'none';
+const currentChoice = 'current';
+
+type Choice = Element | typeof noneChoice | typeof currentChoice;
+
+type LNodeRow = {
+  lNode: Element;
+  headline: string;
+  path: string;
+  reasons: string[];
+  state: BindingStatus['state'];
+};
+
+type ChoiceRow = {
+  value: Choice;
+  headline: string;
+  path: string;
+  issues: BindingIssue[];
   comparison?: TypeComparison;
 };
 
+const statusIcons = { unbound: 'link_off', bound: 'link', warning: 'warning' };
+
+const statusColors = {
+  unbound: 'inherit',
+  bound: 'var(--md-sys-color-primary, #6750a4)',
+  warning: 'var(--md-sys-color-error, #b3261e)',
+};
+
+const warningColor = statusColors.warning;
+
+const searchText = (row: { headline: string; path: string }, notes: string[]) => [
+  row.headline,
+  row.path,
+  ...notes,
+].join(' ');
+
+function differences(comparison?: TypeComparison): string {
+  const names = comparison?.dos.filter(data => data.different).map(data => data.name) ?? [];
+  return names.length > 0 ? `: ${names.join(', ')}` : '';
+}
+
 const minGridSize = 4;
 const maxGridSize = 128;
+const defaultGridSize = 32;
 const zoomFactor = 1.25;
 const fitMargin = 16;
 const panThreshold = 4;
 
 export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElement) {
   static scopedElements = {
-    'oscd-action-list': OscdActionList,
     'oscd-dialog': OscdDialog,
+    'oscd-filled-button': OscdFilledButton,
     'oscd-icon': OscdIcon,
     'oscd-icon-button': OscdIconButton,
     'oscd-outlined-button': OscdOutlinedButton,
-    'oscd-tree': OscdTree,
+    'oscd-outlined-search-field': OscdOutlinedSearchField,
+    'oscd-virtualized-list': OscdVirtualizedList,
     'sld-substation-viewer': SldSubstationViewer,
   };
 
@@ -72,19 +119,22 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
   private lNodeForLink?: Element;
 
   @state()
-  private linkDetails?: LinkDetails;
-
-  @state()
-  private error = '';
+  private choice?: Choice;
 
   @state()
   private legacyLayout = false;
 
   @state()
-  private gridSize = 32;
+  private gridSize = defaultGridSize;
 
   @state()
-  private items: ActionItem[] = [];
+  private items: LNodeRow[] = [];
+
+  @state()
+  private searchTerm = '';
+
+  @state()
+  private choiceSearchTerm = '';
 
   @state()
   private selectable: string[] = [];
@@ -92,9 +142,20 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
   @query('.viewport')
   private viewport?: HTMLElement;
 
+  @query('.choices')
+  private choicesList?: OscdVirtualizedList<ChoiceRow>;
+
+  private context?: BindingContext;
+
+  private assessments: CandidateAssessment[] = [];
+
+  private choiceRows: ChoiceRow[] = [];
+
   private fitted = false;
 
   private fitPending = false;
+
+  private fitMaximum = defaultGridSize;
 
   private observed?: HTMLElement;
 
@@ -112,6 +173,8 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
       });
     }
   });
+
+  private selectionHandled = false;
 
   private pan?: {
     pointer: number;
@@ -134,7 +197,7 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
 
   protected willUpdate(changed: Map<PropertyKey, unknown>): void {
     if (changed.has('doc') || changed.has('docVersion')) {
-      this.linkDetails = undefined;
+      this.context = this.doc ? bindingContext(this.doc) : undefined;
       this.legacyLayout = this.doc ? hasLegacySldLayout(this.doc) : false;
       const substation = this.doc?.querySelector(':root > Substation');
       this.selectable = Array.from(
@@ -144,7 +207,7 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
     if (changed.has('doc')) {
       this.parent = undefined;
       this.lNodeForLink = undefined;
-      this.error = '';
+      this.choice = undefined;
     } else if (changed.has('docVersion') && this.doc) {
       if (this.parent && !this.doc.contains(this.parent)) {
         this.parent = undefined;
@@ -153,8 +216,17 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
         this.lNodeForLink = undefined;
       }
     }
+    if (changed.has('doc') || changed.has('docVersion') || changed.has('lNodeForLink')) {
+      this.assessments = this.lNodeForLink && this.context
+        ? assessCandidates(this.lNodeForLink, this.context)
+        : [];
+      this.choiceRows = this.lNodeForLink ? this.buildChoiceRows() : [];
+      if (changed.has('docVersion') && !this.choiceRows.some(row => row.value === this.choice)) {
+        this.choice = undefined;
+      }
+    }
     if (changed.has('doc') || changed.has('docVersion') || changed.has('parent')) {
-      this.items = this.lNodeItems();
+      this.items = this.lNodeRows();
     }
   }
 
@@ -171,14 +243,31 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
     if (substation !== this.fittedSubstation || (!viewport && this.fittedSubstation)) {
       this.fittedSubstation = viewport ? substation : undefined;
       this.fitted = false;
+      this.fitMaximum = defaultGridSize;
       if (viewport && substation) {
         this.fitPending = true;
         this.zoomToFit();
       }
     }
     if (changed.has('legacyLayout') && !this.legacyLayout && viewport && substation) {
+      this.fitMaximum = defaultGridSize;
       this.fitPending = true;
       this.zoomToFit();
+    }
+    if (changed.has('lNodeForLink') && this.lNodeForLink) {
+      void this.revealSelectedChoice();
+    }
+  }
+
+  private async revealSelectedChoice(): Promise<void> {
+    const list = this.choicesList;
+    await list?.updateComplete;
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => resolve());
+    });
+    const row = this.choiceRows.find(({ value }) => value === this.choice);
+    if (row) {
+      await list?.scrollToItem(row, 'center');
     }
   }
 
@@ -258,33 +347,72 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
       void this.zoomAt(1 / zoomFactor);
     } else if (event.key === '0') {
       event.preventDefault();
-      this.zoomToFit();
+      this.handleFit();
     }
   }
 
+  private handleFit(): void {
+    this.fitMaximum = maxGridSize;
+    this.zoomToFit();
+  }
+
   private handleSelectEquipment(event: CustomEvent<{ element: Element }>): void {
-    this.parent = event.detail.element;
+    const { element } = event.detail;
+    this.parent = this.parent === element ? undefined : element;
+    this.selectionHandled = true;
+  }
+
+  // The viewer's selection event fires before the click bubbles up here, so a
+  // click that selected nothing is a click on the background.
+  private handleDiagramClick(): void {
+    if (!this.selectionHandled) {
+      this.parent = undefined;
+    }
+    this.selectionHandled = false;
   }
 
   private handleLinkDialogClosed(): void {
     this.lNodeForLink = undefined;
+    this.choice = undefined;
+    this.choiceSearchTerm = '';
   }
 
-  private handleLinkDetailsClosed(): void {
-    this.linkDetails = undefined;
+  private handleSearch(event: Event): void {
+    if (event.target instanceof OscdOutlinedSearchField) {
+      this.searchTerm = event.target.value;
+    }
   }
 
-  private handleLink(anyLn: Element): void {
-    if (!this.lNodeForLink) {
+  private handleChoiceSearch(event: Event): void {
+    if (event.target instanceof OscdOutlinedSearchField) {
+      this.choiceSearchTerm = event.target.value;
+    }
+  }
+
+  private handleChoose(value: ChoiceRow['value']): void {
+    this.choice = value;
+  }
+
+  private handleOpenBinding(lNode: Element): void {
+    const status = this.context ? bindingStatus(lNode, this.context) : undefined;
+    if (lNode.getAttribute('iedName') === 'None') {
+      this.choice = noneChoice;
+    } else if (status?.instance !== undefined) {
+      this.choice = status.instance;
+    } else {
+      this.choice = status?.issues.includes('missing-target') ? currentChoice : undefined;
+    }
+    this.lNodeForLink = lNode;
+  }
+
+  private handleSave(): void {
+    const lNode = this.lNodeForLink;
+    const edit = this.choiceEdit();
+    if (lNode === undefined || edit === undefined || conflictingSibling(lNode, edit) !== undefined) {
       return;
     }
-    try {
-      this.dispatchEvent(newEditEventV2(linkEdit(this.lNodeForLink, anyLn)));
-      this.lNodeForLink = undefined;
-      this.error = '';
-    } catch (error) {
-      this.error = error instanceof Error ? error.message : String(error);
-    }
+    this.dispatchEvent(newEditEventV2(edit));
+    this.handleLinkDialogClosed();
   }
 
   private async zoomAt(factor: number, clientX?: number, clientY?: number): Promise<void> {
@@ -322,127 +450,232 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
     if (!Number.isFinite(fit) || fit <= 0) {
       return;
     }
-    this.gridSize = Math.min(maxGridSize, Math.max(minGridSize, Math.floor(fit * 10) / 10));
+    this.gridSize = Math.min(this.fitMaximum, Math.max(minGridSize, Math.floor(fit * 10) / 10));
     viewport.scrollTo(0, 0);
     this.fitted = true;
     this.fitPending = false;
   }
 
-  private lNodeItems(): ActionItem[] {
+  private issueMessage(issue: BindingIssue, comparison?: TypeComparison): string {
+    switch (issue) {
+      case 'duplicate':
+        return msg('Another LNode in this container has the same binding.');
+      case 'missing-target':
+        return msg('The referenced logical node was not found in the document.');
+      case 'missing-types':
+        return msg('Type comparison unavailable: an LNode type definition is missing.');
+      default:
+        return `${msg('The referenced type differs from the specified type')}${differences(comparison)}.`;
+    }
+  }
+
+  private isCurrentChoice(lNode: Element): boolean {
+    if (this.choice === noneChoice) {
+      return lNode.getAttribute('iedName') === 'None';
+    }
+    if (this.choice === currentChoice) {
+      return true;
+    }
+    return this.context !== undefined
+      && this.choice !== undefined
+      && linkedLogicalNode(lNode, this.context.index) === this.choice;
+  }
+
+  private choiceEdit(): SetAttributes | undefined {
+    const lNode = this.lNodeForLink;
+    if (lNode === undefined || this.choice === undefined) {
+      return undefined;
+    }
+    if (this.choice === noneChoice) {
+      return noneEdit(lNode);
+    }
+    return this.assessments.find(({ candidate }) => candidate === this.choice)?.edit;
+  }
+
+  private lNodeRows(): LNodeRow[] {
     const root = this.parent ?? this.doc;
     const selector = this.parent
       ? ':scope > Function LNode, :scope > LNode, :scope > EqFunction LNode, :scope > SubEquipment LNode'
       : ':root > Substation LNode';
-    const nodes = Array.from(root?.querySelectorAll(selector) ?? []);
-    const index = this.doc ? logicalNodeIndex(this.doc) : new Map<string, Element>();
-    const types = new Map(
-      Array.from(this.doc?.querySelectorAll(':root > DataTypeTemplates > LNodeType') ?? [])
-        .map(type => [type.getAttribute('id'), type]),
-    );
-    const item = (lNode: Element): ActionItem => {
-      const linked = lNode.getAttribute('iedName') !== 'None';
-      const instance = linkedLogicalNode(lNode, index);
-      const specifiedType = types.get(lNode.getAttribute('lnType'));
-      const instanceType = instance ? types.get(instance.getAttribute('lnType')) : undefined;
-      const comparison = specifiedType && instanceType
-        ? compareLNodeType(specifiedType, instanceType)
-        : undefined;
-      const detailsLabel = instance
-        ? msg('View type comparison')
-        : msg('Inspect unresolved reference');
+    const { context } = this;
+    if (context === undefined) {
+      return [];
+    }
+    return Array.from(root?.querySelectorAll(selector) ?? []).map((lNode): LNodeRow => {
+      const status = bindingStatus(lNode, context);
       return {
+        lNode,
         headline: lNodeTitle(lNode),
-        supportingText: instance
-          ? `${lNodePath(lNode)} -> ${anyLnPath(instance)}`
+        path: status.instance
+          ? `${lNodePath(lNode)} -> ${anyLnPath(status.instance)}`
           : lNodePath(lNode),
-        startingIcon: linked ? 'link' : 'link_off',
-        actions: linked
-          ? [{
-            icon: comparison?.different === false ? 'check' : 'warning',
-            label: detailsLabel,
-            callback: () => {
-              const message = !instance
-                ? msg('The referenced logical node was not found in the document.')
-                : !comparison
-                  ? msg('The type comparison is unavailable because one or both LNode type definitions are missing.')
-                  : comparison.different
-                    ? msg('The referenced type differs from the specified type.')
-                    : msg('No differences found in the specified type.');
-              this.linkDetails = { title: lNodeTitle(lNode), message, comparison };
-            },
-          }]
-          : [{
-            icon: 'link',
-            label: msg('Link logical node'),
-            callback: () => {
-              this.lNodeForLink = lNode;
-            },
-          }],
+        reasons: status.issues.map(issue => this.issueMessage(issue, status.comparison)),
+        state: status.state,
       };
-    };
-    return [
-      ...nodes.filter(node => node.getAttribute('iedName') === 'None').map(item),
-      ...nodes.filter(node => node.getAttribute('iedName') !== 'None').map(item),
-    ];
+    });
   }
 
-  private renderLinkDialog() {
-    const items: ActionItem[] = this.doc && this.lNodeForLink
-      ? matchingLogicalNodes(this.doc, this.lNodeForLink).map(ln => ({
-        headline: anyLnTitle(ln),
-        supportingText: anyLnPath(ln),
-        primaryAction: () => this.handleLink(ln),
-      }))
-      : [];
+  private buildChoiceRows(): ChoiceRow[] {
+    const lNode = this.lNodeForLink;
+    const status = lNode && this.context ? bindingStatus(lNode, this.context) : undefined;
+    const rows: ChoiceRow[] = [
+      {
+        value: noneChoice,
+        headline: msg('None'),
+        path: msg('Keep this LNode unbound'),
+        issues: [],
+      },
+    ];
+    if (lNode && status?.issues.includes('missing-target')) {
+      rows.push({
+        value: currentChoice,
+        headline: lNodeTitle(lNode),
+        path: [lNode.getAttribute('iedName'), lNode.getAttribute('ldInst')]
+          .filter(part => part !== null && part !== '')
+          .join(' '),
+        issues: status.issues,
+        comparison: status.comparison,
+      });
+    }
+    return rows.concat(
+      this.assessments.map(({ candidate, conflict, comparison }): ChoiceRow => (
+        candidate === status?.instance
+          ? {
+            value: candidate,
+            headline: anyLnTitle(candidate),
+            path: anyLnPath(candidate),
+            issues: status.issues,
+            comparison: status.comparison,
+          }
+          : {
+            value: candidate,
+            headline: anyLnTitle(candidate),
+            path: anyLnPath(candidate),
+            issues: [
+              ...(conflict ? ['duplicate' as const] : []),
+              ...(comparison?.different ? ['mismatch' as const] : []),
+            ],
+            comparison,
+          }
+      )),
+    );
+  }
+
+  private choiceNotes(row: ChoiceRow): string[] {
+    return row.issues.map(issue => this.issueMessage(issue, row.comparison));
+  }
+
+  private renderRowText(row: { path: string }, notes: string[]) {
     return html`
-      <oscd-dialog
-        .open=${this.lNodeForLink !== undefined}
-        @closed=${this.handleLinkDialogClosed}
-      >
-        <div slot="headline">${this.lNodeForLink ? lNodeTitle(this.lNodeForLink) : ''}</div>
-        <div slot="content">
-          ${this.lNodeForLink ? lNodePath(this.lNodeForLink) : ''}
-          ${items.length > 0
-            ? html`<oscd-action-list
-                .filterable=${true}
-                .searchhelper=${msg('Filter logical node instances')}
-                .items=${items}
-              ></oscd-action-list>`
-            : html`<p>${msg('No matching logical nodes found in the IEDs in this document.')}</p>`}
-        </div>
-      </oscd-dialog>
+      <div slot="supporting-text">
+        <div>${row.path}</div>
+        ${notes.map(note => html`<div style="color: ${warningColor}; white-space: normal">${note}</div>`)}
+      </div>
     `;
   }
 
-  private renderLinkDetailsDialog() {
-    const details = this.linkDetails;
+  private renderLNodeRow(row: LNodeRow) {
+    return html`
+      <oscd-list-item type="button" @click=${() => this.handleOpenBinding(row.lNode)}>
+        <oscd-icon slot="start" style="color: ${statusColors[row.state]}">${statusIcons[row.state]}</oscd-icon>
+        <div slot="headline">${row.headline}</div>
+        ${this.renderRowText(row, row.reasons)}
+      </oscd-list-item>
+    `;
+  }
+
+  private renderChoiceRow(row: ChoiceRow) {
+    const selected = this.choice === row.value;
+    const notes = this.choiceNotes(row);
+    const flagged = selected && notes.length > 0 ? `color: ${warningColor}` : '';
+    return html`
+      <oscd-list-item type="button" @click=${() => this.handleChoose(row.value)}>
+        <oscd-icon slot="start" style=${flagged}>${selected ? 'radio_button_checked' : 'radio_button_unchecked'}</oscd-icon>
+        <div slot="headline" style=${flagged}>${row.headline}</div>
+        ${this.renderRowText(row, notes)}
+        ${notes.length > 0
+          ? html`<oscd-icon slot="end" style="color: ${warningColor}">warning</oscd-icon>`
+          : nothing}
+      </oscd-list-item>
+    `;
+  }
+
+  private renderSelectionIssues(lNode: Element) {
+    const edit = this.choiceEdit();
+    const conflict = edit ? conflictingSibling(lNode, edit) : undefined;
+    const row = this.choiceRows.find(({ value }) => value === this.choice);
+    const warnings = (row?.issues ?? [])
+      .filter(issue => !(issue === 'duplicate' && conflict))
+      .map(issue => this.issueMessage(issue, row?.comparison));
+    let blocking: string | undefined;
+    if (conflict) {
+      if (this.choice === noneChoice) {
+        blocking = msg('This LNode cannot be set to None: another LNode in this container is already unbound with the same reference. To unbind it safely, remove this LNode from the function, or bind it to something else.');
+      } else if (this.isCurrentChoice(lNode)) {
+        blocking = this.issueMessage('duplicate');
+      } else {
+        blocking = msg('This logical node cannot be selected: another LNode in this container already has the same binding.');
+      }
+    }
+    return html`
+      <div class="messages">
+        ${blocking === undefined ? nothing : html`<p class="conflict" role="alert">${blocking}</p>`}
+        ${warnings.map(warning => html`<p class="warning" role="status">${warning}</p>`)}
+      </div>
+    `;
+  }
+
+  private renderChoices(lNode: Element) {
+    return html`
+      <oscd-outlined-search-field
+        class="search"
+        aria-label=${msg('Filter logical node instances')}
+        .placeholder=${msg('Filter logical node instances')}
+        .value=${this.choiceSearchTerm}
+        @input=${this.handleChoiceSearch}
+      ></oscd-outlined-search-field>
+      <oscd-virtualized-list
+        class="choices"
+        .label=${msg('Logical node instances')}
+        .items=${this.choiceRows}
+        .searchTerm=${this.choiceSearchTerm}
+        .keyFunction=${(row: ChoiceRow) => row.value}
+        .itemSearchText=${(row: ChoiceRow) => searchText(row, this.choiceNotes(row))}
+        .renderItem=${(row: ChoiceRow) => this.renderChoiceRow(row)}
+      >
+        <p slot="empty">${msg('No logical nodes match the filter.')}</p>
+      </oscd-virtualized-list>
+      ${this.assessments.length === 0
+        ? html`<p>${msg('No matching logical nodes found in the IEDs in this document.')}</p>`
+        : nothing}
+      ${this.renderSelectionIssues(lNode)}
+    `;
+  }
+
+  private renderLinkDialog() {
+    const lNode = this.lNodeForLink;
+    const edit = this.choiceEdit();
+    const saveDisabled = lNode === undefined
+      || edit === undefined
+      || conflictingSibling(lNode, edit) !== undefined
+      || this.isCurrentChoice(lNode);
     return html`
       <oscd-dialog
-        class="link-details"
-        .open=${details !== undefined}
-        @closed=${this.handleLinkDetailsClosed}
+        .open=${lNode !== undefined}
+        @closed=${this.handleLinkDialogClosed}
       >
-        <div slot="headline">${details?.title}</div>
+        <div slot="headline">${lNode ? lNodeTitle(lNode) : ''}</div>
         <div slot="content">
-          <p>${details?.message}</p>
-          ${details?.comparison?.dos.length
-            ? html`<oscd-tree
-                .data=${details.comparison.dos}
-                .renderItem=${({ node, active }: TreeRenderContext<TypeComparison['dos'][number]>) => html`
-                  <oscd-tree-item ?active=${active}>
-                    <span slot="headline">${node.name}</span>
-                    <span slot="supporting-text">${node.diffType === 'missing'
-                      ? msg('Missing from referenced type')
-                      : node.different ? msg('Different') : msg('Matches')}</span>
-                  </oscd-tree-item>
-                `}
-              ></oscd-tree>`
-            : nothing}
+          ${lNode ? lNodePath(lNode) : ''}
+          ${lNode ? this.renderChoices(lNode) : nothing}
         </div>
         <div slot="actions">
-          <oscd-outlined-button @click=${this.handleLinkDetailsClosed}>
-            ${msg('Close')}
+          <oscd-outlined-button class="cancel" @click=${this.handleLinkDialogClosed}>
+            ${msg('Cancel')}
           </oscd-outlined-button>
+          <oscd-filled-button class="save" ?disabled=${saveDisabled} @click=${this.handleSave}>
+            ${msg('Save')}
+          </oscd-filled-button>
         </div>
       </oscd-dialog>
     `;
@@ -469,6 +702,7 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
         .selectable=${this.selectable}
         .highlight=${highlight}
         @oscd-sld-selected=${this.handleSelectEquipment}
+        @click=${this.handleDiagramClick}
       ></sld-substation-viewer>
     `;
   }
@@ -479,7 +713,6 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
     }
     const substation = this.doc.querySelector(':root > Substation');
     return html`
-      ${this.error ? html`<p role="alert">${this.error}</p>` : nothing}
       ${substation
         ? html`<main>
             <section class="diagram">
@@ -490,7 +723,7 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
                 <oscd-icon-button class="zoom-in" aria-label=${msg('Zoom in')} title=${msg('Zoom in')} ?disabled=${this.legacyLayout} @click=${() => this.zoomAt(zoomFactor)}>
                   <oscd-icon>zoom_in</oscd-icon>
                 </oscd-icon-button>
-                <oscd-icon-button class="zoom-fit" aria-label=${msg('Fit diagram')} title=${msg('Fit diagram')} ?disabled=${this.legacyLayout} @click=${this.zoomToFit}>
+                <oscd-icon-button class="zoom-fit" aria-label=${msg('Fit diagram')} title=${msg('Fit diagram')} ?disabled=${this.legacyLayout} @click=${this.handleFit}>
                   <oscd-icon>fit_screen</oscd-icon>
                 </oscd-icon-button>
               </nav>
@@ -509,18 +742,31 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
                 <div class="canvas">${this.renderDiagram(substation)}</div>
               </div>
             </section>
-            <oscd-action-list
-              .filterable=${true}
-              .searchhelper=${msg('Filter LNodes')}
-              .items=${this.items}
-            ></oscd-action-list>
+            <section class="lnodes">
+              <oscd-outlined-search-field
+                class="search"
+                aria-label=${msg('Filter LNodes')}
+                .placeholder=${msg('Filter LNodes')}
+                .value=${this.searchTerm}
+                @input=${this.handleSearch}
+              ></oscd-outlined-search-field>
+              <oscd-virtualized-list
+                .label=${msg('LNodes')}
+                .items=${this.items}
+                .searchTerm=${this.searchTerm}
+                .keyFunction=${(row: LNodeRow) => row.lNode}
+                .itemSearchText=${(row: LNodeRow) => searchText(row, row.reasons)}
+                .renderItem=${(row: LNodeRow) => this.renderLNodeRow(row)}
+              >
+                <p slot="empty">${msg('No LNodes match the filter.')}</p>
+              </oscd-virtualized-list>
+            </section>
           </main>`
         : html`<section class="empty-state" aria-labelledby="empty-state-title">
             <h2 id="empty-state-title">${msg('No Substation detected')}</h2>
             <p>${msg('Add a Substation to view and map its LNodes.')}</p>
           </section>`}
       ${this.renderLinkDialog()}
-      ${this.renderLinkDetailsDialog()}
     `;
   }
 
@@ -540,14 +786,40 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
       padding: 1rem;
     }
     .diagram,
-    main > oscd-action-list {
+    .lnodes {
       flex: 1;
       min-width: 0;
     }
-    .diagram {
+    .diagram,
+    .lnodes {
       display: flex;
       flex-direction: column;
       min-height: 0;
+    }
+    .search {
+      margin: 8px;
+    }
+    oscd-dialog .search {
+      display: flex;
+      margin: 8px 0;
+    }
+    .lnodes > oscd-virtualized-list {
+      flex: 1 1 auto;
+    }
+    oscd-dialog {
+      min-height: min(640px, 100% - 48px);
+      max-height: min(760px, 100% - 48px);
+    }
+    .choices {
+      height: min(40vh, 320px);
+    }
+    .messages {
+      position: sticky;
+      bottom: 0;
+      background: var(--md-sys-color-surface-container-high, #ece6f0);
+    }
+    .warning {
+      color: var(--md-sys-color-error, #b3261e);
     }
     .viewport {
       flex: 1;
@@ -567,10 +839,8 @@ export default class OscdEditorLnodeMapper extends ScopedElementsMixin(LitElemen
     .canvas {
       width: max-content;
     }
-    main > oscd-action-list {
-      overflow: auto;
-    }
-    [role='alert'] {
+    [role='alert'],
+    .conflict {
       color: var(--md-sys-color-error, #b3261e);
     }
   `;

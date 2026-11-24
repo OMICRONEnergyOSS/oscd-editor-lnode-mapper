@@ -1,5 +1,5 @@
-import OscdMenuOpen from '@omicronenergy/oscd-menu-open';
-import OscdMenuSave from '@omicronenergy/oscd-menu-save';
+import OscdMenuOpen from '@omicronenergy/oscd-menu-commons/oscd-menu-open.js';
+import OscdMenuSave from '@omicronenergy/oscd-menu-commons/oscd-menu-save.js';
 import OscdEditorLnodeMapper from '../dist/oscd-editor-lnode-mapper.js';
 
 const shell = document.querySelector('oscd-shell');

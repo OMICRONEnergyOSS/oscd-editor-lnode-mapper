@@ -5,8 +5,8 @@ import {
   linkEdit,
   linkedLogicalNode,
   lNodePath,
-  matchingLogicalNodes,
 } from './lnode-mapping.js';
+import { candidatesByClass } from './binding.js';
 
 describe('LNode mapping', () => {
   const parse = () =>
@@ -28,7 +28,7 @@ describe('LNode mapping', () => {
   it('finds a matching class in a later IED and creates a complete EditV2 link', () => {
     const doc = parse();
     const lNode = doc.querySelector('LNode')!;
-    const candidates = matchingLogicalNodes(doc, lNode);
+    const candidates = candidatesByClass(doc).get('XCBR') ?? [];
     expect(candidates).to.have.length(1);
     expect(lNodePath(lNode)).to.equal('S/V/B');
     expect(anyLnPath(candidates[0])).to.equal('IED2 LD');
