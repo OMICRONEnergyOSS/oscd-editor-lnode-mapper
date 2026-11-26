@@ -1,6 +1,6 @@
 {
   "name": "@omicronenergy/oscd-editor-lnode-mapper",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "OpenSCD editor for mapping Substation LNodes to logical node instances",
   "type": "module",
   "license": "Apache-2.0",
